@@ -60,7 +60,7 @@ sen_it <- mpc_stac %>%
   items_sign(
     sign_fn = sign_planetary_computer(
       headers = c(
-        "Ocp-Apim-Subscription-Key" = "315d8e6c206a4da4bd2c143f26573c82"
+        "Ocp-Apim-Subscription-Key" = ""
       )
     )
   ) %>%
