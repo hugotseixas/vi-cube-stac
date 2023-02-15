@@ -1,0 +1,169 @@
+---
+title: "vi_cube_stac"
+author: "Hugo Tameirão Seixas"
+format: html
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+#| label: libraries
+#| include: false
+
+library(terra)
+library(stars)
+library(sf)
+library(rstac)
+library(gdalcubes)
+library(tictoc)
+library(janitor)
+library(lubridate)
+library(tidyverse)
+
+```
+
+```{r}
+#| label: tic
+
+tic()
+
+```
+
+```{r}
+#| label: set-aoi
+
+aoi <- st_read("data/aoi.fgb")
+
+bbox <- st_bbox(aoi)
+
+bbox_wgs <- aoi %>%
+  st_transform("EPSG:4326") %>%
+  st_bbox()
+
+```
+
+```{r}
+#| label: connect-stac
+
+mpc_stac <- stac("https://planetarycomputer.microsoft.com/api/stac/v1/")
+
+sen_it <- mpc_stac %>%
+  stac_search(
+    collections = "sentinel-2-l2a",
+    bbox = c(
+      bbox_wgs["xmin"],bbox_wgs["ymin"],
+      bbox_wgs["xmax"],bbox_wgs["ymax"]
+    ),
+    datetime = "2018-01-01/2020-12-31"
+  ) %>%
+  get_request() %>%
+  items_sign(
+    sign_fn = sign_planetary_computer(
+      headers = c(
+        "Ocp-Apim-Subscription-Key" = "315d8e6c206a4da4bd2c143f26573c82"
+      )
+    )
+  ) %>%
+  items_fetch()
+
+```
+
+```{r}
+#| label: create-cube
+
+sen_c <-
+  stac_image_collection(
+    s = sen_it$features,
+    asset_names = c("B04", "B08"),
+    property_filter = function(x) {x[["eo:cloud_cover"]] < 20}
+  )
+
+sen_view <-
+  cube_view(
+    srs = st_crs(aoi)$wkt,
+    extent = list(
+      t0 = "2018-01-01", t1 = "2020-12-31",
+      left = bbox["xmin"], right = bbox["xmax"],
+      top = bbox["ymax"], bottom = bbox["ymin"]),
+    dx = 10, dy = 10,
+    dt = "P2M",
+    aggregation = "median",
+    resampling = "bilinear"
+  )
+
+sen_cube <-
+  raster_cube(
+    image_collection = sen_c,
+    view = sen_view
+  ) %>%
+  select_bands(c("B04","B08")) %>%
+  write_ncdf("data/vi_cube.nc", overwrite = TRUE)
+
+```
+
+```{r}
+#| label: extract-data
+
+targets <- st_read("data/targets.fgb")
+
+gdalcubes_options(parallel = 16, ncdf_compression_level = 5)
+
+sen_ts <- 
+  ncdf_cube("data/vi_cube.nc") %>%
+  apply_pixel("(B08-B04)/(B08+B04)", "NDVI") %>%
+  extract_geom(targets) %>%
+  as_tibble() %>%
+  clean_names()
+
+sen_ts %>%
+  mutate(
+    time = ymd(time),
+    fid = fct(as.character(fid))
+  ) %>%
+  summarise(
+    median = median(ndvi),
+    min = quantile(ndvi, 0.10),
+    max = quantile(ndvi, 0.90),
+    .by = c(time, fid)
+  ) %>%
+  ggplot(
+    aes(
+      x = time, y = median,
+      ymin = min, ymax = max,
+      fill = fid, group = fid
+    )
+  ) +
+  facet_wrap(vars(fid), ncol = 1) +
+  geom_line() +
+  geom_ribbon(alpha = 0.5) +
+  theme_minimal()
+
+sen_stars <- ncdf_cube("data/vi_cube.nc") %>%
+  apply_pixel("(B08-B04)/(B08+B04)", "NDVI") %>%
+  reduce_time("min(NDVI)", "max(NDVI)", "median(NDVI)") %>%
+  rename_bands(NDVI_min = "ndvi_min") %>%
+  filter_geom(st_geometry(targets)) %>%
+  st_as_stars() %>%
+  st_redimension(name = "bands")
+
+ggplot() +
+  facet_wrap(vars(bands), ncol = 1) +
+  geom_stars(data = sen_stars) +
+  geom_sf(
+    data = targets, 
+    fill = NA,
+    linewidth = 1,
+    color = "#000000"
+  ) +
+  scale_fill_distiller(palette = "YlOrBr", na.value = "transparent") +
+  theme_void()
+
+```
+
+```{r}
+#| label: toc
+
+toc()
+
+```
+
