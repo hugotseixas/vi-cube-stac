@@ -1,124 +1,129 @@
 ---
-title: "vi_cube_stac"
 author: "Hugo Tameirão Seixas"
-format: html
+format: 
+  html:
+    embed-resources: true
 editor_options: 
   chunk_output_type: console
+params:
+  area: "6"
+
 ---
 
 ```{r}
 #| label: libraries
 #| include: false
 
+library(glue)
 library(terra)
 library(stars)
 library(sf)
 library(rstac)
 library(gdalcubes)
-library(tictoc)
 library(janitor)
-library(lubridate)
+library(fs)
 library(tidyverse)
 
 ```
 
 ```{r}
-#| label: tic
-
-tic()
-
-```
-
-```{r}
 #| label: set-aoi
+#| include: false
 
-aoi <- st_read("data/aoi.fgb")
+targets <- 
+  read_sf("data/targets.gpkg") |>
+  filter(id == params$area)
 
-bbox <- st_bbox(aoi)
+targets_area <- st_area(targets)
 
-bbox_wgs <- aoi %>%
-  st_transform("EPSG:4326") %>%
+bbox <- st_bbox(targets)
+
+bbox_sen <- targets |>
+  st_transform("EPSG:3857") |>
   st_bbox()
 
 ```
 
 ```{r}
-#| label: connect-stac
+#| label: get-cube
+#| include: false
 
-mpc_stac <- stac("https://planetarycomputer.microsoft.com/api/stac/v1/")
+if (!file_exists(glue("data/vi_cube_{params$area}.nc"))) {
+  
+  mpc_stac <- stac("https://planetarycomputer.microsoft.com/api/stac/v1/")
 
-sen_it <- mpc_stac %>%
-  stac_search(
-    collections = "sentinel-2-l2a",
-    bbox = c(
-      bbox_wgs["xmin"],bbox_wgs["ymin"],
-      bbox_wgs["xmax"],bbox_wgs["ymax"]
-    ),
-    datetime = "2018-01-01/2020-12-31"
-  ) %>%
-  get_request() %>%
-  items_sign(
-    sign_fn = sign_planetary_computer(
-      headers = c(
-        "Ocp-Apim-Subscription-Key" = ""
+  sen_it <- mpc_stac %>%
+    stac_search(
+      collections = "sentinel-2-l2a",
+      bbox = c(
+        bbox["xmin"], bbox["ymin"],
+        bbox["xmax"], bbox["ymax"]
+      ),
+      datetime = glue("{targets$start_date}/{targets$end_date}"),
+      limit = 1000
+    ) %>%
+    get_request() %>%
+    items_sign(
+      sign_fn = sign_planetary_computer(
+        headers = c(
+          "Ocp-Apim-Subscription-Key" = "a0819286f5834452b5a3db24f5b19ecb"
+        )
       )
     )
-  ) %>%
-  items_fetch()
+  
+  sen_c <-
+    stac_image_collection(
+      s = sen_it$features,
+      asset_names = c("B04", "B08"),
+      property_filter = function(x) {x[["eo:cloud_cover"]] < 20}
+    )
+
+  sen_view <-
+    cube_view(
+      srs = st_crs(bbox_sen)$wkt,
+      extent = list(
+        t0 = as.character(targets$start_date), 
+        t1 = as.character(targets$end_date),
+        left = bbox_sen["xmin"], right = bbox_sen["xmax"],
+        top = bbox_sen["ymax"], bottom = bbox_sen["ymin"]),
+      dx = 10, dy = 10,
+      dt = "P1M",
+      aggregation = "median",
+      resampling = "bilinear"
+    )
+
+  sen_cube <-
+    raster_cube(
+      image_collection = sen_c,
+      view = sen_view
+    ) %>%
+    select_bands(c("B04","B08")) %>%
+    write_ncdf(
+      glue("data/vi_cube_{params$area}.nc"), 
+      overwrite = TRUE
+    )
+  
+}
 
 ```
 
 ```{r}
-#| label: create-cube
-
-sen_c <-
-  stac_image_collection(
-    s = sen_it$features,
-    asset_names = c("B04", "B08"),
-    property_filter = function(x) {x[["eo:cloud_cover"]] < 20}
-  )
-
-sen_view <-
-  cube_view(
-    srs = st_crs(aoi)$wkt,
-    extent = list(
-      t0 = "2018-01-01", t1 = "2020-12-31",
-      left = bbox["xmin"], right = bbox["xmax"],
-      top = bbox["ymax"], bottom = bbox["ymin"]),
-    dx = 10, dy = 10,
-    dt = "P2M",
-    aggregation = "median",
-    resampling = "bilinear"
-  )
-
-sen_cube <-
-  raster_cube(
-    image_collection = sen_c,
-    view = sen_view
-  ) %>%
-  select_bands(c("B04","B08")) %>%
-  write_ncdf("data/vi_cube.nc", overwrite = TRUE)
-
-```
-
-```{r}
-#| label: extract-data
-
-targets <- st_read("data/targets.fgb")
+#| label: create-vis
+#| include: false
 
 gdalcubes_options(parallel = 16, ncdf_compression_level = 5)
 
 sen_ts <- 
-  ncdf_cube("data/vi_cube.nc") %>%
+  ncdf_cube(glue("data/vi_cube_{params$area}.nc")) %>%
   apply_pixel("(B08-B04)/(B08+B04)", "NDVI") %>%
   extract_geom(targets) %>%
   as_tibble() %>%
-  clean_names()
+  clean_names() %>%
+  drop_na()
 
-sen_ts %>%
+vis_ts <- sen_ts %>%
   mutate(
-    time = ymd(time),
-    fid = fct(as.character(fid))
+    time = ymd(time)
   ) %>%
   summarise(
     median = median(ndvi),
@@ -133,37 +138,117 @@ sen_ts %>%
       fill = fid, group = fid
     )
   ) +
-  facet_wrap(vars(fid), ncol = 1) +
   geom_line() +
-  geom_ribbon(alpha = 0.5) +
-  theme_minimal()
+  geom_ribbon(alpha = 0.5, fill = "#c4c4c4") +
+  scale_x_date(
+    date_labels = "%F", 
+    date_breaks = "12 months",
+    expand = c(0.01, 0.01)
+  ) +
+  labs(y = "NDVI") +
+  theme_minimal() +
+  theme(
+    axis.title.x = element_blank()
+  )
 
-sen_stars <- ncdf_cube("data/vi_cube.nc") %>%
+sen_stars <- 
+  ncdf_cube(glue("data/vi_cube_{params$area}.nc")) %>%
   apply_pixel("(B08-B04)/(B08+B04)", "NDVI") %>%
-  reduce_time("min(NDVI)", "max(NDVI)", "median(NDVI)") %>%
-  rename_bands(NDVI_min = "ndvi_min") %>%
+  reduce_time("median(NDVI)") %>%
   filter_geom(st_geometry(targets)) %>%
-  st_as_stars() %>%
-  st_redimension(name = "bands")
+  st_as_stars()
 
-ggplot() +
-  facet_wrap(vars(bands), ncol = 1) +
+vis_map <- ggplot() +
   geom_stars(data = sen_stars) +
   geom_sf(
-    data = targets, 
+    data = st_transform(targets, "EPSG:3857"), 
     fill = NA,
-    linewidth = 1,
+    linewidth = 2,
     color = "#000000"
   ) +
-  scale_fill_distiller(palette = "YlOrBr", na.value = "transparent") +
+  labs(fill = "NDVI") +
+  scale_fill_distiller(
+    palette = "YlOrBr", 
+    na.value = "transparent",
+    direction = 0
+  ) +
   theme_void()
 
+vis_hist <- sen_stars |>
+  as_tibble() |>
+  ggplot() +
+  geom_histogram(
+    aes(x = NDVI_median, fill = after_stat(x)),
+    color = "#000000"
+  ) +
+  labs(x = "NDVI", y = "Count") +
+  scale_fill_distiller(
+    palette = "YlOrBr", 
+    na.value = "transparent",
+    direction = 0
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = ""
+  )
+
 ```
+
+# Analysis of area `r params$area`
+
+:::: {.columns}
+
+::: {.column width="45%"}
+
+This is an agriculture field. 
+
+NDVI was calculated using Sentinel 2 images. 
+
+It covers an area of **`r round(targets_area * 0.0001)` ha**.
+
+The map shows the median values from **`r min(sen_ts$time)`** to **`r max(sen_ts$time)`**.
 
 ```{r}
-#| label: toc
+#| label: plot-hist
+#| echo: false
+#| warning: false
 
-toc()
+vis_hist
 
 ```
 
+:::
+
+::: {.column width="10%"}
+<!-- empty column to create gap -->
+:::
+
+::: {.column width="45%"}
+
+```{r}
+#| label: plot-map
+#| echo: false
+
+vis_map
+
+```
+
+It is possible to observe the variation of the median over the area. This can indicate areas with different vegetation cover along the years.
+
+When analyzing the historical median NDVI, we can observe that the maximum value is **`r round(max(sen_stars$NDVI_median, na.rm = T), digits = 2)`**, the minimum value is **`r round(min(sen_stars$NDVI_median, na.rm = T), digits = 2)`**, and the median value is **`r round(median(sen_stars$NDVI_median, na.rm = T), digits = 2)`**
+
+:::
+
+::::
+
+```{r}
+#| label: plot-ts
+#| echo: false
+#| fig-asp: 0.2
+#| out-width: 100%
+
+vis_ts
+
+```
+
+We can also observe the temporal variation of the NDVI in this field.
