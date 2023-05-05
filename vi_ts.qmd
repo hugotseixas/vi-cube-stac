@@ -66,7 +66,7 @@ if (!file_exists(glue("data/vi_cube_{params$area}.nc"))) {
     items_sign(
       sign_fn = sign_planetary_computer(
         headers = c(
-          "Ocp-Apim-Subscription-Key" = "a0819286f5834452b5a3db24f5b19ecb"
+          "Ocp-Apim-Subscription-Key" = ""
         )
       )
     )
